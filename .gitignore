@@ -1,0 +1,24 @@
+# Local assets and packaged builds
+/portable_config/scripts/newbv/bbll-assets/
+/portable_config/scripts/newbv/bbll-vectors/
+/portable_config/scripts/newbv/bbll-icons.json
+/portable_config/scripts/newbv/bbll-launcher.png.base64
+*.apk
+*.exe
+*.dll
+*.zip
+*.7z
+
+# Local state and test output
+/portable_config/cache/
+/portable_config/watch_later/
+/portable_config/recent.json
+/portable_config/danmaku-history.json
+/portable_config/switch-opts-backup.json
+/portable_config/celebi.txt
+*.dpapi
+*.log
+*.tmp
+settings.json
+search-history.json
+mpv-newbv-quality.json
