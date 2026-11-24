@@ -5,6 +5,9 @@ function Assert-Equal($Actual, $Expected) {
     if ($Actual -cne $Expected) { throw "Expected '$Expected', got '$Actual'" }
 }
 
+function Test-DashAudioUrl([string]$Url, [int]$TimeoutMs) {
+    return $Url -notlike '*unreachable*'
+}
 $images = @{
     img_url = 'https://example.invalid/7cd084941338484aae1ad9425b84077c.png'
     sub_url = 'https://example.invalid/4932caff0ff746eab6f01bf08b70ac45.png'
@@ -48,6 +51,11 @@ function Invoke-BiliApi($Path, $Parameters, [switch]$Signed) {
             Assert-Equal $Parameters.keyword 'test keyword'
             @{result = @(@{bvid = 'BV1GJ411x7h7'; title = '<em>Test</em> &amp; more'; author = 'Author'})}
         }
+        '/x/web-interface/wbi/index/top/feed/rcmd' {
+            Assert-Equal $Parameters.fresh_idx 8
+            Assert-Equal $Parameters.fresh_idx_1h 8
+            @{item = @(@{bvid = 'BV1GJ411x7h7'; title = 'Fresh recommendation'})}
+        }
         default { throw "Unexpected endpoint: $Path" }
     }
 }
@@ -84,12 +92,52 @@ if ($audioResult.video -notmatch 'codec=aac;[^;]*,flags=default;' -or
     $audioResult.video -notmatch 'codec=flac;[^;]*Hi-Res / FLAC 2003 kbps[^;]*;%\d+%https://example.invalid/flac' -or
     $audioResult.video -notmatch 'codec=eac3;[^;]*Dolby / E-AC-3' -or
     $audioResult.video -notmatch 'codec=ac3;[^;]*Dolby / AC-3') { throw 'Unexpected extended DASH audio track metadata.' }
+$dolbyDash = @{video = @(
+    @{id = 126; codecid = 12; codecs = 'dvhe.05.07'; baseUrl = 'https://example.invalid/vision'},
+    @{id = 120; codecid = 13; baseUrl = 'https://example.invalid/4k-av1'}
+); audio = $testDash.audio}
+$vision = Select-Dash $dolbyDash 126 @() 100 'av1'
+Assert-Equal $vision.defaultVid 1
+Assert-Equal $vision.tracks[0].title '杜比视界 / HEVC'
+Assert-Equal ([regex]::Matches($vision.video, '!delay_open,media_type=video').Count) 1
+if ($vision.video -notmatch '!no_chapters;!track_meta,title=[^;]+,flags=default;%\d+%https://example.invalid/vision') {
+    throw 'The Dolby Vision MP4 should open with its real codec metadata.'
+}
+Assert-Equal (Select-Dash $dolbyDash 120 @() 100 'av1').defaultVid 2
 $preferredFlac = Select-Dash $testDash 127 @() 100 '' 'flac'
 if ($preferredFlac.video -notmatch 'codec=flac;[^;]*,flags=default;' -or $preferredFlac.video -match 'codec=aac;[^;]*,flags=default;') {
     throw 'Preferred FLAC should be selected without hiding AAC.'
 }
 $fallbackAudio = Select-Dash @{video = $testDash.video; audio = $testDash.audio} 127 @() 100 '' 'flac'
 if ($fallbackAudio.video -notmatch 'codec=aac;[^;]*,flags=default;') { throw 'Missing AAC fallback.' }
+$backupDash = @{video = $testDash.video; audio = @(
+    @{id = 30280; bandwidth = 198000; baseUrl = 'https://example.invalid/unreachable'; backup_url = @('https://example.invalid/backup')},
+    @{id = 30232; bandwidth = 104000; baseUrl = 'https://example.invalid/aac-low'}
+)}
+$checked = Select-Dash $backupDash 127 @() 100 -VerifyAudio
+Assert-Equal $checked.defaultAid 1
+if ($checked.video -notmatch 'codec=aac;[^;]*,flags=default;%\d+%https://example.invalid/backup') { throw 'Preferred backup was not selected.' }
+$backupDash.audio[0].backup_url = @()
+$checked = Select-Dash $backupDash 127 @() 100 -VerifyAudio
+Assert-Equal $checked.defaultAid 2
+$backupDash.video = @(@{
+    id = 120; codecid = 13; baseUrl = 'https://primary.example.invalid/video'
+    backupUrl = @('https://primary.example.invalid/video?copy=1', 'https://backup.example.invalid/video',
+        'https://backup.example.invalid/video', 'https://third.example.invalid/video', 'file:///invalid')
+})
+$backupDash.audio[0].backupUrl = @('https://backup.example.invalid/aac')
+$alternate = Select-Dash $backupDash 120 @() 100 'av1' -VerifyAudio
+Assert-Equal $alternate.defaultVid 1
+Assert-Equal $alternate.defaultAid 1
+if ($alternate.backupVideo -notmatch 'https://backup.example.invalid/video' -or
+    $alternate.backupVideo -notmatch 'https://backup.example.invalid/aac' -or
+    $alternate.backupVideo -match 'unreachable|copy=1') { throw 'Backup EDL did not keep the working audio and switch CDN.' }
+Assert-Equal ([regex]::Matches($alternate.backupVideo, ',flags=default').Count) 2
+Assert-Equal $alternate.backupVideos.Count 3
+Assert-Equal $alternate.backupVideos[0] $alternate.backupVideo
+if ($alternate.backupVideos[1] -notmatch 'https://third.example.invalid/video' -or
+    $alternate.backupVideos[1] -notmatch 'https://backup.example.invalid/aac' -or
+    $alternate.backupVideos[2] -notmatch 'copy=1') { throw 'Distinct CDN hosts should precede same-host URLs.' }
 $testDash.audio = @()
 $testDash.dolby = $null
 $flacOnly = Select-Dash $testDash 127 @() 100
@@ -106,6 +154,7 @@ $search = Search-Videos 'test keyword'
 Assert-Equal $search.items.Count 1
 Assert-Equal $search.items[0].label 'Test & more  /  Author'
 Assert-Equal $search.items[0].url 'https://www.bilibili.com/video/BV1GJ411x7h7'
+Assert-Equal ((Get-BrowsePage 'home' 1 8).items[0].title) 'Fresh recommendation'
 
 $loginKey = '0123456789abcdef0123456789abcdef'
 $script:sessionFile = Join-Path ([IO.Path]::GetTempPath()) ('newbv-test-' + [Guid]::NewGuid().ToString('N') + '.dpapi')
@@ -247,4 +296,37 @@ $history = Get-CatalogPage 'history' 2 '123:456:archive'
 Assert-Equal $history.items[0].url 'https://www.bilibili.com/video/BV1GJ411x7h7?p=2'
 Assert-Equal $history.items[0].progress 17
 Assert-Equal (Get-CatalogPage 'comments:12:999' 1 '').items[0].title 'Reply'
+
+& {
+    $mock = @{failure = 'Bilibili /x/web-interface/view HTTP 412.'; pageRequests = 0; bvid = 'BV1GJ411x7h7'}
+    function Invoke-BiliApi($Path, $Parameters) { throw $mock.failure }
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param([string]$Uri, [switch]$UseBasicParsing, [int]$MaximumRedirection, [int]$TimeoutSec)
+        $mock.pageRequests++
+        if ($Uri -cnotmatch '^https://www\.bilibili\.com/zh-Hans/video/(BV1GJ411x7h7|av123)/$') { throw "Unexpected URL: $Uri" }
+        $initial = @{videoData = @{
+            bvid = $mock.bvid; aid = 123; title = 'Public video'
+            pages = @(@{page = 1; cid = 100; part = 'A'}, @{page = 2; cid = 200; part = 'B'})
+        }} | ConvertTo-Json -Depth 6 -Compress
+        $html = '<script>window.__INITIAL_STATE__=' + $initial + ';(function(){throw "Do not execute script";}());</script>'
+        @{RawContentStream = [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($html))}
+    }
+    $detail = Get-VideoDetails 'BV1GJ411x7h7?p=2'
+    Assert-Equal $detail.title 'Public video'
+    Assert-Equal $detail.part 2
+    Assert-Equal $detail.parts[1].url 'https://www.bilibili.com/video/BV1GJ411x7h7?p=2'
+    Assert-Equal (Get-VideoMetadata (Read-VideoId 'av123')).pages[1].cid 200
+    Assert-Equal $mock.pageRequests 2
+
+    $mock.bvid = 'BV1KEJ36bEid'
+    $failure = try { Get-VideoMetadata (Read-VideoId 'BV1GJ411x7h7') } catch { $_.Exception.Message }
+    Assert-Equal $failure $mock.failure
+    Assert-Equal $mock.pageRequests 3
+
+    $mock.failure = 'Bilibili /x/web-interface/view HTTP 403.'
+    $failure = try { Get-VideoMetadata (Read-VideoId 'BV1GJ411x7h7') } catch { $_.Exception.Message }
+    Assert-Equal $failure $mock.failure
+    Assert-Equal $mock.pageRequests 3
+}
 'NewBV contract checks passed.'

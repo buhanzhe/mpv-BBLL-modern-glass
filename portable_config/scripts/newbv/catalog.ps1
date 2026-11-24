@@ -55,7 +55,7 @@ function Resolve-SeasonEpisode([long]$Id, [int]$TargetQuality, [string]$CodecPre
     if (-not $episode.cid) { throw 'Episode unavailable.' }
     $parameters = @{ep_id = $Id; cid = $episode.cid; qn = 127; fnval = 4048; fourk = 1}
     $manifest = Invoke-BiliApi '/pgc/player/web/playurl' $parameters
-    $streams = Select-Dash $manifest.dash $TargetQuality $manifest.support_formats ([int]$manifest.dash.duration) $CodecPreference $AudioPreference
+    $streams = Select-Dash $manifest.dash $TargetQuality $manifest.support_formats ([int]$manifest.dash.duration) $CodecPreference $AudioPreference -VerifyAudio
     if (-not $streams) { throw 'No playable episode stream for this account or region.' }
     $streams.title = $season.title + ' - ' + $episode.title + ' ' + $episode.long_title
     $streams.byline = [string]$season.title

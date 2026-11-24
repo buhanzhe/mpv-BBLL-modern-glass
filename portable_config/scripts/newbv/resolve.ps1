@@ -8,7 +8,8 @@ param(
     [ValidateRange(0, 30000)][int]$LiveQuality = 10000,
     [ValidateRange(1, 127)][int]$Quality = 127,
     [ValidateSet('', 'h264', 'hevc', 'av1')][string]$PreferredCodec = '',
-    [ValidateSet('aac','flac','eac3')][string]$PreferredAudio = 'aac'
+    [ValidateSet('aac','flac','eac3')][string]$PreferredAudio = 'aac',
+    [int]$FeedIndex = 0
 )
 
 $userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -87,12 +88,84 @@ function Read-VideoId([string]$Value) {
     throw 'Expected a Bilibili video URL or a BV/av ID.'
 }
 
-function Get-MediaUrl($Track) {
+function Get-PublicVideoMetadata($Target) {
+    $id = if ($Target.key -eq 'aid') { 'av' + $Target.id } else { $Target.id }
+    $url = $referrer + 'zh-Hans/video/' + $id + '/'
+    $response = Invoke-WebRequest -Uri $url -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 8 -ErrorAction Stop
+    $html = [Text.Encoding]::UTF8.GetString($response.RawContentStream.ToArray())
+    $state = [regex]::Match($html, '(?s)<script\b[^>]*>\s*window\.__INITIAL_STATE__\s*=\s*(.*?)</script\s*>')
+    if (-not $state.Success) { return }
+    # The public page includes a JSON object followed by an inline cleanup function.
+    $payload = [regex]::Match($state.Groups[1].Value, '(?s)^(\{.*\})\s*(?:;\s*\(\s*function\b.*)?;?\s*$')
+    if (-not $payload.Success) { return }
+    $video = ($payload.Groups[1].Value | ConvertFrom-Json).videoData
+    if ($video.bvid -cmatch '^BV[A-Za-z0-9]{10}$' -and
+        [string]$video.($Target.key) -ceq $Target.id -and $video.pages.Count -gt 0) { return $video }
+}
+
+function Get-VideoMetadata($Target) {
+    try { return Invoke-BiliApi '/x/web-interface/view' @{$Target.key = $Target.id} }
+    catch {
+        if ($_.Exception.Message -notmatch '(?:HTTP 412\.|\[-412\]\.)$') { throw }
+        $failure = $_
+        try {
+            $video = Get-PublicVideoMetadata $Target
+            if ($video) { return $video }
+        } catch {}
+        throw $failure
+    }
+}
+
+function Get-MediaUrls($Track) {
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($candidate in @($Track.baseUrl, $Track.base_url, $Track.url) + @($Track.backupUrl) + @($Track.backup_url)) {
         [Uri]$uri = $null
         if ($candidate -and $candidate -notmatch '[\x00-\x20]' -and
             [Uri]::TryCreate($candidate, [UriKind]::Absolute, [ref]$uri) -and
-            $uri.Scheme -eq 'https' -and $uri.Host -and -not $uri.UserInfo) { return [string]$candidate }
+            $uri.Scheme -eq 'https' -and $uri.Host -and -not $uri.UserInfo -and $seen.Add([string]$candidate)) { [string]$candidate }
+    }
+}
+
+function Get-MediaUrl($Track) {
+    Get-MediaUrls $Track | Select-Object -First 1
+}
+
+function Get-BackupMediaUrls($Track, [string]$Primary, $FailedUrls) {
+    $hosts = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [void]$hosts.Add(([Uri]$Primary).Host)
+    $sameHost = @()
+    foreach ($url in (Get-MediaUrls $Track)) {
+        if ($url -ceq $Primary -or ($FailedUrls -and $FailedUrls.Contains($url))) { continue }
+        if ($hosts.Add(([Uri]$url).Host)) { $url }
+        else { $sameHost += $url }
+    }
+    $sameHost
+}
+
+function Test-DashAudioUrl([string]$Url, [int]$TimeoutMs) {
+    $reply = $null
+    try {
+        $request = [Net.HttpWebRequest][Net.WebRequest]::Create($Url)
+        $request.UserAgent = $userAgent
+        $request.Referer = $referrer
+        $request.Timeout = $TimeoutMs
+        $request.ReadWriteTimeout = $TimeoutMs
+        $request.MaximumAutomaticRedirections = 2
+        $request.AddRange(0, 1023)
+        $reply = $request.GetResponse()
+        $stream = $reply.GetResponseStream()
+        $header = [byte[]]::new(8)
+        $read = 0
+        while ($read -lt $header.Length) {
+            $chunk = $stream.Read($header, $read, $header.Length - $read)
+            if ($chunk -eq 0) { break }
+            $read += $chunk
+        }
+        return $read -eq $header.Length -and [Text.Encoding]::ASCII.GetString($header, 4, 4) -in @('ftyp','styp','moov')
+    } catch {
+        return $false
+    } finally {
+        if ($reply) { $reply.Dispose() }
     }
 }
 
@@ -100,7 +173,8 @@ function Format-EdlValue([string]$Value) {
     '%' + [Text.Encoding]::UTF8.GetByteCount($Value) + '%' + $Value
 }
 
-function Format-DashTrack($Track, [string]$MediaType, [string]$Label, [string]$Codec, [bool]$Default, [int]$Duration) {
+function Format-DashTrack($Track, [string]$MediaType, [string]$Label, [string]$Codec, [bool]$Default, [int]$Duration,
+        [string]$Url, $FailedUrls) {
     $info = "!delay_open,media_type=$MediaType,codec=$Codec"
     if ($MediaType -eq 'video') {
         $rate = 0
@@ -112,9 +186,14 @@ function Format-DashTrack($Track, [string]$MediaType, [string]$Label, [string]$C
     }
     $meta = '!track_meta,title=' + (Format-EdlValue $Label) + ',byterate=' + [int]($Track.bandwidth / 8)
     if ($Default) { $meta += ',flags=default' }
-    $entry = Format-EdlValue (Get-MediaUrl $Track)
-    if ($Duration -gt 0) { $entry += ",length=$Duration" }
-    "!new_stream;!no_clip;!no_chapters;$info;$meta;$entry"
+    if (-not $Url) { $Url = Get-MediaUrl $Track }
+    # Open Dolby Vision's MP4 header so the EDL track retains its Dolby profile and level.
+    if ($MediaType -eq 'video' -and ([int]$Track.id -eq 126 -or [string]$Track.codecs -match '^(dvhe|dvh1)\.')) { $info = '' }
+    if ($info) { $info += ';' }
+    $prefix = "!new_stream;!no_clip;!no_chapters;$info$meta;"
+    $length = if ($Duration -gt 0) { ",length=$Duration" } else { '' }
+    $urls = @($Url) + @(Get-BackupMediaUrls $Track $Url $FailedUrls | Select-Object -First 3)
+    @{sources = @($urls | ForEach-Object { $prefix + (Format-EdlValue $_) + $length })}
 }
 
 function Get-DashAudioTracks($Dash) {
@@ -136,12 +215,13 @@ function Get-DashAudioTracks($Dash) {
                 '^ac-3(?:\.|$)' { $codec = 'ac3'; $title = 'Dolby / AC-3' }
             }
             if ($track.bandwidth -gt 0) { $title += " $([int]($track.bandwidth / 1000)) kbps" }
-            @{track = $track; codec = $codec; title = $title}
+            @{track = $track; codec = $codec; title = $title; url = $url}
         }
     }
 }
 
-function Select-Dash($Dash, [int]$TargetQuality, $Formats, [int]$Duration, [string]$CodecPreference = '', [string]$AudioPreference = 'aac') {
+function Select-Dash($Dash, [int]$TargetQuality, $Formats, [int]$Duration, [string]$CodecPreference = '', [string]$AudioPreference = 'aac',
+        [switch]$VerifyAudio) {
     $codecNames = @{'7' = 'h264'; '12' = 'hevc'; '13' = 'av1'}
     $codecLabels = @{'7' = 'AVC'; '12' = 'HEVC'; '13' = 'AV1'}
     $qualityLabels = @{}
@@ -154,10 +234,30 @@ function Select-Dash($Dash, [int]$TargetQuality, $Formats, [int]$Duration, [stri
         Sort-Object -Property $ordering)
     $audios = @(Get-DashAudioTracks $Dash)
     if (-not $videos.Count -or -not $audios.Count) { return }
+    $failedAudioUrls = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $defaultAudio = 0
     for ($index = 0; $index -lt $audios.Count; $index++) {
         $codec = $audios[$index].codec
         if ($codec -eq $AudioPreference -or ($AudioPreference -eq 'eac3' -and $codec -eq 'ac3')) { $defaultAudio = $index; break }
+    }
+    if ($VerifyAudio) {
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $indices = @($defaultAudio) + @(0..($audios.Count - 1) | Where-Object { $_ -ne $defaultAudio })
+        $verified = $false
+        foreach ($index in $indices) {
+            foreach ($url in (Get-MediaUrls $audios[$index].track | Select-Object -First 3)) {
+                $timeout = [Math]::Min(500, 1300 - [int]$timer.ElapsedMilliseconds)
+                if ($timeout -lt 100) { break }
+                if (Test-DashAudioUrl $url $timeout) {
+                    $audios[$index].url = $url
+                    $defaultAudio = $index
+                    $verified = $true
+                    break
+                }
+                [void]$failedAudioUrls.Add($url)
+            }
+            if ($verified -or $timer.ElapsedMilliseconds -ge 1200) { break }
+        }
     }
     $quality = ($videos | Where-Object { $_.id -le $TargetQuality } | Select-Object -First 1).id
     if (-not $quality) { $quality = $videos[-1].id }
@@ -173,7 +273,7 @@ function Select-Dash($Dash, [int]$TargetQuality, $Formats, [int]$Duration, [stri
             $track = $videos[$index]
             $codec = [string]$track.codecid
             $label = $qualityLabels[[int]$track.id]
-            if (-not $label) { $label = if ($track.height) { "$($track.height)p" } else { "QN $($track.id)" } }
+            if (-not $label) { $label = if ([int]$track.id -eq 126) { '杜比视界' } elseif ($track.height) { "$($track.height)p" } else { "QN $($track.id)" } }
             @{id = $index + 1; quality = [int]$track.id; codec = $codecNames[$codec]; title = $label + ' / ' + $codecLabels[$codec]}
         }
     )
@@ -184,15 +284,29 @@ function Select-Dash($Dash, [int]$TargetQuality, $Formats, [int]$Duration, [stri
         }
         for ($index = 0; $index -lt $audios.Count; $index++) {
             $audio = $audios[$index]
-            Format-DashTrack $audio.track 'audio' $audio.title $audio.codec ($index -eq $defaultAudio) $Duration
+            Format-DashTrack $audio.track 'audio' $audio.title $audio.codec ($index -eq $defaultAudio) $Duration $audio.url $failedAudioUrls
         }
     )
-    @{video = ('edl://' + ($entries -join ';')); defaultVid = $defaultVideo + 1; tracks = $trackInfo}
+    $routes = @(
+        for ($route = 0; $route -lt 4; $route++) {
+            if (-not ($entries | Where-Object { $_.sources.Count -gt $route } | Select-Object -First 1)) { break }
+            $streams = foreach ($entry in $entries) {
+                $entry.sources[[Math]::Min($route, $entry.sources.Count - 1)]
+            }
+            'edl://' + ($streams -join ';')
+        }
+    )
+    $result = @{video = $routes[0]; defaultVid = $defaultVideo + 1; defaultAid = $defaultAudio + 1; tracks = $trackInfo}
+    if ($routes.Count -gt 1) {
+        $result.backupVideo = $routes[1]
+        $result.backupVideos = @($routes | Select-Object -Skip 1)
+    }
+    $result
 }
 
 function Resolve-Video([string]$Value, [int]$TargetQuality, [string]$CodecPreference = '', [string]$AudioPreference = 'aac') {
     $target = Read-VideoId $Value
-    $detail = Invoke-BiliApi '/x/web-interface/view' @{$target.key = $target.id}
+    $detail = Get-VideoMetadata $target
     $page = $detail.pages | Where-Object { $_.page -eq $target.part } | Select-Object -First 1
     if (-not $page.cid) { throw "Video part $($target.part) does not exist." }
 
@@ -201,7 +315,7 @@ function Resolve-Video([string]$Value, [int]$TargetQuality, [string]$CodecPrefer
         $manifest = Invoke-BiliApi '/x/player/wbi/playurl' $parameters -Signed
         $duration = [int]$page.duration
         if ($duration -le 0) { $duration = [int]$manifest.dash.duration }
-        $streams = Select-Dash $manifest.dash $TargetQuality $manifest.support_formats $duration $CodecPreference $AudioPreference
+        $streams = Select-Dash $manifest.dash $TargetQuality $manifest.support_formats $duration $CodecPreference $AudioPreference -VerifyAudio
         if (-not $streams) { throw 'No complete DASH video/audio pair.' }
     } catch {
         $parameters = @{bvid = $detail.bvid; cid = $page.cid; qn = $TargetQuality; fnval = 1; fnver = 0; fourk = 0; type = 'mp4'; platform = 'html5'; otype = 'json'}
@@ -271,13 +385,14 @@ function Search-Videos([string]$Keyword, [int]$PageNumber = 1, [string]$Sort = '
     @{items = $items; more = $PageNumber -lt [int]$result.numPages}
 }
 
-function Get-BrowsePage([string]$Section, [int]$PageNumber) {
+function Get-BrowsePage([string]$Section, [int]$PageNumber, [int]$FeedIndex = 0) {
     $more = $false
     switch ($Section) {
         'home' {
             try {
+                $index = if ($FeedIndex -gt 0) { $FeedIndex } else { $PageNumber }
                 $feed = Invoke-BiliApi '/x/web-interface/wbi/index/top/feed/rcmd' @{
-                    fresh_type = 3; ps = 24; fresh_idx = $PageNumber; fresh_idx_1h = $PageNumber; feed_version = 'V8'
+                    fresh_type = 3; ps = 24; fresh_idx = $index; fresh_idx_1h = $index; feed_version = 'V8'
                 } -Signed
                 $cards = @($feed.item | ForEach-Object { Format-Card $_ })
                 if ($cards.Count) { return @{items = $cards; more = $true} }
@@ -307,7 +422,7 @@ function Get-VideoDetails([string]$Value) {
     if ($Value -cmatch '^https://www\.bilibili\.com/bangumi/play/ss([1-9]\d{0,12})$') { return Get-SeasonDetails ([long]$Matches[1]) }
     if ($Value -cmatch '^https://www\.bilibili\.com/bangumi/play/ep([1-9]\d{0,12})$') { return Get-SeasonDetails ([long]$Matches[1]) 'ep_id' }
     $target = Read-VideoId $Value
-    $detail = Invoke-BiliApi '/x/web-interface/view' @{$target.key = $target.id}
+    $detail = Get-VideoMetadata $target
     $card = Format-Card $detail
     if (-not $card) { throw 'Video details unavailable.' }
     $card.description = [string]$detail.desc
@@ -333,7 +448,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         if ($Action -in @('interaction','heartbeat')) { $script:apiSession = New-BiliSession (Read-BiliSession -IncludeCsrf) }
         $result = switch ($Action) {
             'search' { if (-not $value) { throw 'Empty or invalid input.' }; Search-Videos $value $Page $Order $SearchType }
-            'browse' { Get-BrowsePage $value $Page }
+            'browse' { Get-BrowsePage $value $Page $FeedIndex }
             'detail' { Get-VideoDetails $value }
             'catalog' { Get-CatalogPage $value $Page $Cursor }
             'resolve' {
@@ -344,7 +459,7 @@ if ($MyInvocation.InvocationName -ne '.') {
             }
             'subtitles' {
                 $target = Read-VideoId $value
-                $detail = Invoke-BiliApi '/x/web-interface/view' @{$target.key = $target.id}
+                $detail = Get-VideoMetadata $target
                 $part = $detail.pages | Where-Object { $_.page -eq $target.part } | Select-Object -First 1
                 if ($part.cid) { Get-VideoSubtitles $detail.bvid $part.cid } else { @{tracks = @()} }
             }

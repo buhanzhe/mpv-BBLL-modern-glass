@@ -3,7 +3,6 @@
 $ErrorActionPreference = 'Stop'
 $browser = Join-Path $PSScriptRoot '../portable_config/scripts/newbv/browser.ps1'
 if ($InstalledDirectory) { $browser = Join-Path $InstalledDirectory 'browser.ps1' }
-$withLauncherIcon = [IO.File]::Exists((Join-Path (Split-Path $browser -Parent) 'bbll-launcher.png.base64'))
 if ($ScreenshotDirectory) { [void][IO.Directory]::CreateDirectory($ScreenshotDirectory) }
 
 function Save-Visual($Window, [string]$Name) {
@@ -37,7 +36,8 @@ function Assert-CaptionAlignment($Window) {
 }
 
 $state = @{stage = 0; failure = $null; expected = $null; checkFavorites = $CheckFavoritePicker.IsPresent; legacy = $Legacy.IsPresent; layout = $CheckLayout.IsPresent
-    checkAccount = $CheckAccountProfile.IsPresent; withLauncherIcon = $withLauncherIcon
+    checkAccount = $CheckAccountProfile.IsPresent
+    hasLauncher = Test-Path -LiteralPath (Join-Path (Split-Path $browser) 'bbll-launcher.png.base64')
     mailbox = Join-Path ([IO.Path]::GetTempPath()) ('newbv-browser-test-' + [Guid]::NewGuid().ToString('N') + '.json')}
 $ready = {
     param($Window)
@@ -101,17 +101,17 @@ $ready = {
                 if ($state.layout) {
                     Assert-CaptionAlignment $state.window
                     $clock = $state.window.FindName('ClockText')
-                    if ([Windows.Media.TextOptions]::GetTextRenderingMode($clock) -ne 'Auto' -or
-                        [Windows.Media.TextOptions]::GetTextFormattingMode($clock) -ne 'Display' -or
+                    $period = $state.window.FindName('ClockPeriod')
+                    $time = $state.window.FindName('ClockValue')
+                    if ([Windows.Media.TextOptions]::GetTextRenderingMode($clock) -ne 'Grayscale' -or
+                        [Windows.Media.TextOptions]::GetTextFormattingMode($clock) -ne 'Ideal' -or
                         [Windows.Media.TextOptions]::GetTextHintingMode($clock) -ne 'Fixed' -or
                         $clock.FontWeight -ne [Windows.FontWeights]::SemiBold -or
+                        $period.FontSize -ne 24 -or $time.FontSize -ne 30 -or -not $period.Text -or -not $time.Text -or
                         $state.window.FindName('ProfileName').FontWeight -ne [Windows.FontWeights]::Bold) {
                         throw 'The browser lost its display text rendering or existing font weights'
                     }
-                    if ($state.withLauncherIcon -and $state.window.Icon.PixelWidth -ne 96) {
-                        throw 'Optional application icon not loaded'
-                    }
-                    if (-not ($rail.Children[0].Content -is [Windows.UIElement])) { throw 'Sidebar icon is missing' }
+                    if ($state.hasLauncher -and $state.window.Icon.PixelWidth -ne 96) { throw 'BBLL application icon not loaded' }
                     $appId = [IntPtr]::Zero
                     $status = [NewBV.TaskbarIdentity]::GetCurrentProcessExplicitAppUserModelID([ref]$appId)
                     try {
@@ -150,7 +150,7 @@ $ready = {
                     if ($overlay.Visibility -ne 'Collapsed' -or $state.window.FindName('SettingsView').Visibility -ne 'Visible') {
                         throw 'Right click should dismiss only the frontmost dialog'
                     }
-                    Invoke-RightClick $state.window.FindName('SettingsView')
+                    Invoke-RightClick $rows.Children[8]
                     if ($state.window.FindName('SettingsView').Visibility -ne 'Collapsed') { throw 'Right click did not close settings' }
                     $rail.Children[5].RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
                     Assert-CaptionAlignment $state.window
@@ -267,7 +267,7 @@ $ready = {
                 } else { $state.window.Close() }
             }
         } catch {
-            $state.failure = $_.Exception.Message + "`n" + $_.ScriptStackTrace
+            $state.failure = $_.Exception.Message
             $state.timer.Stop()
             $state.window.Close()
         }

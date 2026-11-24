@@ -1,5 +1,5 @@
 ﻿$settingsFile = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'mpv-newbv\settings.json'
-$defaults = @{start = 'home'; picture = 480; theme = 'dark'; fullscreen = $false; quality = $null; codec = ''; audio = 'aac'
+$defaults = @{start = 'home'; autobrowse = ($DefaultAutobrowse -ne 'no'); picture = 480; theme = 'dark'; fullscreen = $false; quality = $null; qualityRevision = $null; codec = ''; audio = 'aac'
     speed = 1; subtitles = 'auto'; danmaku = 'theme'; dmSize = $null; dmOpacity = $null; dmSpeed = $null
     dmArea = $null; dmDensity = $null; dmTop = $true; dmBottom = $true}
 $settings = $defaults.Clone()
@@ -41,13 +41,14 @@ $settingGroups = @(
             (New-SettingChoice 'following-seasons' '追番'), (New-SettingChoice 'following-series' '追剧'),
             (New-SettingChoice 'later' '稍后观看'), (New-SettingChoice 'search' '搜索')
         )},
+        @{title = '随 mpv 启动打开 BBLL'; key = 'autobrowse'; choices = @((New-SettingChoice $true '开'), (New-SettingChoice $false '关'))},
         @{title = '图片质量'; key = 'picture'; choices = @((New-SettingChoice 320 '小尺寸'), (New-SettingChoice 480 '中尺寸'), (New-SettingChoice 640 '大尺寸'))},
         @{title = '主题'; key = 'theme'; choices = @((New-SettingChoice 'dark' '黑色'), (New-SettingChoice 'background' 'BBLL 背景图'))},
         @{title = '以全屏模式运行'; key = 'fullscreen'; choices = @((New-SettingChoice $false '关'), (New-SettingChoice $true '开'))},
         @{title = '账号登录 / 退出'; action = 'account'}
     )},
     @{title = '播放设置'; icon = 'icon_video_play_count'; rows = @(
-        @{title = '默认画质'; key = 'quality'; choices = @((New-SettingChoice $null '自动 / 最高可用'), (New-SettingChoice 120 '4K'), (New-SettingChoice 112 '1080P 高码率'), (New-SettingChoice 80 '1080P'), (New-SettingChoice 64 '720P'), (New-SettingChoice 32 '480P'))},
+        @{title = '默认画质'; key = 'quality'; choices = @((New-SettingChoice $null '自动 / 最高可用'), (New-SettingChoice 126 '杜比视界'), (New-SettingChoice 120 '4K'), (New-SettingChoice 112 '1080P 高码率'), (New-SettingChoice 80 '1080P'), (New-SettingChoice 64 '720P'), (New-SettingChoice 32 '480P'))},
         @{title = '默认音轨'; key = 'audio'; choices = @((New-SettingChoice 'aac' 'AAC'), (New-SettingChoice 'flac' 'Hi-Res / FLAC'), (New-SettingChoice 'eac3' 'Dolby'))},
         @{title = '默认播放速度'; key = 'speed'; choices = @((New-SettingChoice 1 '1.0×'), (New-SettingChoice 1.25 '1.25×'), (New-SettingChoice 1.5 '1.5×'), (New-SettingChoice 2 '2.0×'))},
         @{title = '视频编码'; key = 'codec'; choices = @((New-SettingChoice '' '自动'), (New-SettingChoice 'h264' 'AVC'), (New-SettingChoice 'hevc' 'HEVC'), (New-SettingChoice 'av1' 'AV1'))},
@@ -100,10 +101,12 @@ function Select-SettingValue($Row) {
     }
     Show-BbllDialog $Row.title $Row.choices $selected {
         param($choice, $key)
-        if ($settings[$key] -eq $choice.value) { return }
+        if ($settings[$key] -eq $choice.value -and $key -ne 'quality') { return }
         $previous = $settings[$key]
+        $revision = $settings.qualityRevision
         $settings[$key] = $choice.value
-        if (-not (Save-BrowserSettings)) { $settings[$key] = $previous; return }
+        if ($key -eq 'quality') { $settings.qualityRevision = [Guid]::NewGuid().ToString('N') }
+        if (-not (Save-BrowserSettings)) { $settings[$key] = $previous; $settings.qualityRevision = $revision; return }
         Apply-BrowserTheme
         if ($key -eq 'fullscreen') { $window.WindowState = if ($settings.fullscreen) { 'Maximized' } else { 'Normal' } }
         Render-SettingsGroup $script:settingsGroup
@@ -189,9 +192,6 @@ function Close-Settings {
 }
 
 function Initialize-Settings {
-    if (-not $Backdrop.Source) {
-        $settingGroups[0].rows = @($settingGroups[0].rows | Where-Object { $_.key -ne 'theme' })
-    }
     Set-ButtonIcon $SettingsBack 'icon_back' '返回'
     $SettingsBack.add_Click({ Close-Settings })
     for ($index = 0; $index -lt $settingGroups.Count; $index++) {

@@ -8,13 +8,17 @@
 - 在选片窗口扫码登录，查看历史、收藏、稍后再看和关注。登录后，普通视频及剧集会定期上报观看进度，切换或关闭视频时会尝试保存最后的进度。
 - 优先选择可用的高画质，记住手动选择的画质和编码。视频有对应音轨时可选 Hi-Res FLAC 或 Dolby E-AC-3。
 - 播放时保留选片页面。窗口支持标题区拖动、边缘缩放、右键返回及最小化、全屏和关闭。
+- 点播遇到断流时会依次尝试可用的备用 CDN，同一视频从中断位置继续，保留所选画质、音轨和播放队列。
+- 再次点击已选中的列表标签会回顶并刷新。进入动态时从顶部显示，卡片高亮跟随键盘导航。
 - 接入 `uosc_danmaku 2.2.0` 后，可在选片设置中实时调整字号、速度、透明度、占屏比、同屏数量及悬停弹幕。
 
 ## 安装
 
 准备 Windows 10 或 11、Windows PowerShell 5.1 和支持 `mp.input` 的 Windows 版 mpv。本项目用 mpv 0.42.0 验证。需要播放器主题时，可先下载 modern_glass 便携配置。 [mpv 下载](https://mpv.io/installation/)，[akFace/mpv.config](https://github.com/akFace/mpv.config)
 
-在本仓库目录运行下面的命令，将示例路径换成你自己的 mpv 目录。
+可从 [Releases](https://github.com/buhanzhe/mpv-BBLL-modern-glass/releases) 下载插件 ZIP。解压后将 `newbv` 文件夹放入 mpv 安装目录下的 `portable_config/scripts/`，再重启 mpv。
+
+如从源码安装，在本仓库目录运行下面的命令，将示例路径换成自己的 mpv 目录。
 
 ```powershell
 $mpvRoot = 'C:\Apps\mpv'
@@ -60,6 +64,12 @@ powershell.exe -NoProfile -STA -File .\tests\test_newbv_browser.ps1 -CheckLayout
 ```
 
 第一项使用离线数据验证接口参数和会话处理。第二项需要联网，在真实 WPF 窗口验证导航、窗口按钮及连续选片。
+
+可用 Python、FFmpeg 和 FFprobe 运行自动换线回归测试，模拟主线路中断和备用线路返回 503。
+
+```powershell
+python .\tests\mpv_newbv_recovery.py --mpv 'C:\Apps\mpv\mpv.exe'
+```
 
 ## 许可与致谢
 

@@ -5,7 +5,7 @@
         WindowStartupLocation="CenterScreen" WindowStyle="None" ResizeMode="CanResize"
         Background="#303030" Foreground="#EEE" FontFamily="Microsoft YaHei UI, Segoe UI" xml:lang="zh-CN"
         UseLayoutRounding="True" SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display"
-        TextOptions.TextRenderingMode="Auto">
+        TextOptions.TextRenderingMode="Grayscale">
     <shell:WindowChrome.WindowChrome>
         <shell:WindowChrome CaptionHeight="0" ResizeBorderThickness="6" GlassFrameThickness="0"
                             CornerRadius="0" UseAeroCaptionButtons="False"/>
@@ -76,6 +76,29 @@
                             <Trigger Property="IsKeyboardFocused" Value="True">
                                 <Setter TargetName="FocusBorder" Property="Background" Value="#715C91"/>
                             </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="DynamicCard" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="DynamicCardFill" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="2" CornerRadius="9"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <MultiDataTrigger>
+                                <MultiDataTrigger.Conditions>
+                                    <Condition Binding="{Binding IsKeyboardFocused, RelativeSource={RelativeSource Self}}" Value="True"/>
+                                    <Condition Binding="{Binding Tag, RelativeSource={RelativeSource AncestorType={x:Type Window}}}" Value="True"/>
+                                </MultiDataTrigger.Conditions>
+                                <Setter TargetName="DynamicCardFill" Property="Background" Value="#715C91"/>
+                            </MultiDataTrigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
@@ -217,7 +240,10 @@
                     <Grid DockPanel.Dock="Right" Height="52" Margin="0,16,10,0" VerticalAlignment="Top">
                         <TextBlock x:Name="ClockText" VerticalAlignment="Center"
                                    FontFamily="Segoe UI, Microsoft YaHei UI" FontSize="30" FontWeight="SemiBold"
-                                   Typography.NumeralAlignment="Tabular"/>
+                                   TextOptions.TextFormattingMode="Ideal"
+                                   Typography.NumeralAlignment="Tabular">
+                            <Run x:Name="ClockPeriod" FontSize="24" BaselineAlignment="Center"/><Run x:Name="ClockValue"/>
+                        </TextBlock>
                     </Grid>
                     <ScrollViewer x:Name="HeaderScroll" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" Focusable="False">
                         <StackPanel x:Name="HeaderTabs" Orientation="Horizontal" Margin="20,16,0,0"/>
@@ -270,7 +296,7 @@
         <Grid x:Name="ProfileOverlay" Background="#99000000" Visibility="Collapsed" Focusable="True"
               KeyboardNavigation.IsTabStop="False" Panel.ZIndex="9">
             <Grid Width="334" Height="380" HorizontalAlignment="Center" VerticalAlignment="Center">
-                <Border Background="#424242" CornerRadius="14" Margin="0,67,0,0" RenderOptions.ClearTypeHint="Enabled">
+                <Border Background="#424242" CornerRadius="14" Margin="0,67,0,0">
                     <Grid>
                         <StackPanel Margin="16,79,16,0">
                             <TextBlock x:Name="ProfileName" FontSize="26" FontWeight="Bold"

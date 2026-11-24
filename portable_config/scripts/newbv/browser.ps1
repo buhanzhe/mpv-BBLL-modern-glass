@@ -1,5 +1,5 @@
 ﻿param([string]$Assets, [scriptblock]$OnReady, [string]$CurrentVideo = '', [string]$StartView = 'detail', [switch]$SignInOnStart,
-    [string]$PlayMailbox = '', [int]$MpvProcessId = 0)
+    [string]$PlayMailbox = '', [int]$MpvProcessId = 0, [ValidateSet('yes','no')][string]$DefaultAutobrowse = 'yes')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 try {
@@ -16,7 +16,7 @@ $helper = Join-Path $PSScriptRoot 'resolve.ps1'
 if (-not $Assets) { $Assets = Join-Path $PSScriptRoot 'bbll-assets' }
 $xml = [xml][IO.File]::ReadAllText((Join-Path $PSScriptRoot 'browser.xaml'))
 $window = [Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($xml))
-foreach ($name in @('Backdrop','Sidebar','AccountButton','SettingsButton','HeaderTabs','ClockText',
+foreach ($name in @('Backdrop','Sidebar','AccountButton','SettingsButton','HeaderTabs','ClockText','ClockPeriod','ClockValue',
         'Viewport','Body','MoreButton','StatusText','StatusLayer','Header','MainView','SettingsView',
         'EmptyState','EmptyMessage','EmptyAction','EmptyActionText',
         'SettingsHeader','SettingsBack','SettingsCategories','SettingsRows','SettingsScroll','HeaderScroll',
@@ -61,6 +61,7 @@ $requests = @{page = $null; account = $null}
 $script:grid = $null
 $script:output = $null
 $script:mailboxSequence = 0
+$script:homeFeedIndex = 0
 $script:selected = 0
 $script:searchBox = $null
 $script:lastSearch = ''
@@ -206,10 +207,10 @@ function Invoke-Request([string]$Action, [string]$Value, [int]$Number, [scriptbl
     Cancel-Request $Channel
     $worker = [PowerShell]::Create()
     [void]$worker.AddScript(@'
-param($helper, $action, $value, $number, $cursor, $order, $searchType)
-& $helper -Action $action -Query ('q:' + $value) -Page $number -Cursor $cursor -Order $order -SearchType $searchType
+param($helper, $action, $value, $number, $cursor, $order, $searchType, $feedIndex)
+& $helper -Action $action -Query ('q:' + $value) -Page $number -Cursor $cursor -Order $order -SearchType $searchType -FeedIndex $feedIndex
 '@).AddArgument($helper).AddArgument($Action).AddArgument($Value).AddArgument($Number).AddArgument(
-        [string]$Context.cursor).AddArgument($script:sort).AddArgument($script:searchType)
+        [string]$Context.cursor).AddArgument($script:sort).AddArgument($script:searchType).AddArgument([int]$Context.feedIndex)
     $requests[$Channel] = @{action = $Action; worker = $worker; task = $worker.BeginInvoke(); done = $Done; context = $Context}
     $timer.Start()
 }
@@ -330,7 +331,10 @@ function Set-Header {
             [Windows.Automation.AutomationProperties]::SetName($button, $item.title)
             $button.Tag = @{choice = $item; rail = $key}
             $button.add_GotKeyboardFocus({ param($sender, $event) $sender.BringIntoView() })
-            $button.add_Click({ param($sender, $event) Open-Section $sender.Tag.choice $sender.Tag.rail })
+            $button.add_Click({ param($sender, $event)
+                $refresh = $sender.Tag.rail -eq $script:page.rail -and $sender.Tag.choice.id -eq $script:page.id
+                Open-Section $sender.Tag.choice $sender.Tag.rail $refresh
+            })
             [void]$HeaderTabs.Children.Add($button)
         }
     }
@@ -417,6 +421,7 @@ function New-Cover($Item) {
 function Add-Card($Item) {
     $index = $cards.Count
     $button = [Windows.Controls.Button]::new()
+    if ($script:page.id -eq 'dynamic') { $button.Style = $window.FindResource('DynamicCard') }
     $button.Tag = @{item = $Item; index = $index}
     $button.Padding = [Windows.Thickness]::new(8,11,8,10)
     $button.HorizontalContentAlignment = 'Stretch'
@@ -430,6 +435,7 @@ function Add-Card($Item) {
     } })
     [void]$content.Children.Add($frame)
     $title = New-Text $Item.title 21 $normal $true
+    [Windows.Media.TextOptions]::SetTextFormattingMode($title, [Windows.Media.TextFormattingMode]::Ideal)
     $title.TextWrapping = 'Wrap'
     $title.LineHeight = 31
     $title.LineStackingStrategy = 'BlockLineHeight'
@@ -473,10 +479,11 @@ function Render-Page([int]$FocusIndex = -1) {
         $box = [Windows.Controls.TextBox]::new()
         $box.Height = 37
         $box.FontSize = 23
-        $box.Padding = [Windows.Thickness]::new(9,5,9,5)
+        $box.Padding = [Windows.Thickness]::new(27,5,9,5)
         $box.Margin = [Windows.Thickness]::new(0)
         $box.Background = [Windows.Media.Brushes]::Transparent
         $box.Foreground = $normal
+        $box.CaretBrush = $normal
         $box.BorderThickness = [Windows.Thickness]::new(0)
         $box.Text = $script:lastSearch
         $box.MaxLength = 400
@@ -490,10 +497,12 @@ function Render-Page([int]$FocusIndex = -1) {
         $hint.Margin = [Windows.Thickness]::new(27,0,0,0)
         $hint.IsHitTestVisible = $false
         $hint.Visibility = if ($box.Text) { 'Collapsed' } else { 'Visible' }
-        $box.add_TextChanged({
+        $updateHint = {
             param($sender, $event)
-            $sender.Tag.Visibility = if ($sender.Text) { 'Collapsed' } else { 'Visible' }
-        })
+            $sender.Tag.Visibility = if ($sender.Text -or $sender.IsKeyboardFocused) { 'Collapsed' } else { 'Visible' }
+        }
+        $box.add_TextChanged($updateHint)
+        $box.add_IsKeyboardFocusedChanged($updateHint)
         $box.Tag = $hint
         $searchFrame = [Windows.Controls.Grid]::new()
         [void]$searchFrame.Children.Add($box)
@@ -802,6 +811,7 @@ function Load-Page([bool]$Append = $false) {
         default { 'catalog' }
     }
     $value = if ($action -eq 'search') { $script:lastSearch } else { $state.id }
+    $feedIndex = if ($state.id -eq 'home') { (++$script:homeFeedIndex) } else { 0 }
     Show-Status '正在加载…'
     Invoke-Request $action $value $number {
         param($data, $context)
@@ -835,9 +845,10 @@ function Load-Page([bool]$Append = $false) {
         }
         if ($cards.Count) { Show-Status } else { Show-EmptyState '这里还没有内容。' }
         Update-More
-        if ($cards.Count -gt $firstNew -and $SignInOverlay.Visibility -ne 'Visible' -and
+        if ($cards.Count -gt $firstNew -and ($state.id -ne 'dynamic' -or $firstNew -eq 0 -or $window.Tag) -and
+            $SignInOverlay.Visibility -ne 'Visible' -and
             ([Windows.Input.Keyboard]::FocusedElement -isnot [Windows.Controls.TextBox])) { Select-Card $firstNew }
-    } @{state = $state; number = $number; cursor = $state.cursor}
+    } @{state = $state; number = $number; cursor = $state.cursor; feedIndex = $feedIndex}
 }
 
 function New-Page([string]$Id, [string]$Title, [string]$Rail, [bool]$Standalone = $false) {
@@ -854,12 +865,15 @@ function Open-Section($Section, [string]$Rail = '', [bool]$Reload = $false) {
         if ($Rail -eq 'home') { $Section = $homePages[0] }
     }
     if ($script:page) { $script:page.focus = $script:selected }
-    if ($Section.id -eq 'history') { $Reload = $true }
+    if ($Section.id -eq 'history' -or ($Section.id -eq 'dynamic' -and $script:page.id -eq 'dynamic')) {
+        $Reload = $true
+    }
     $cacheKey = $Rail + ':' + $Section.id
     if ($Reload -or -not $pageCache.ContainsKey($cacheKey)) {
         $pageCache[$cacheKey] = New-Page $Section.id $Section.title $Rail
     }
     $script:page = $pageCache[$cacheKey]
+    if ($Section.id -eq 'dynamic') { $script:page.focus = 0 }
     Render-Page $script:page.focus
     if ($Section.id -eq 'search') {
         if (-not $script:keywords.Count) { Load-HotSearch }
@@ -931,7 +945,12 @@ function Back {
     if ($stack.Count) {
         Cancel-Request
         $script:page = $stack.Pop()
-        if ($script:page.id -eq 'detail') { Render-Detail $script:page.detail; return }
+        if ($script:page.id -eq 'detail') {
+            if ($script:page.detail -or $script:page.detailFailure) {
+                Render-Detail $script:page.detail $script:page.detailFailure
+            } else { Load-Detail }
+            return
+        }
         if ($script:page.id -eq 'actions') { Render-VideoActions $script:page.video; return }
         Render-Page $script:page.focus
     } elseif ($script:page.id -eq 'search' -and $script:page.loaded) {
@@ -949,7 +968,36 @@ function Invoke-BrowserBack {
     elseif ($script:page) { Back }
 }
 
-function Render-Detail($data) {
+function Show-DetailError([string]$Message, [string]$Url) {
+    $label = New-Text $Message 17 $secondary
+    $label.TextWrapping = 'Wrap'
+    $label.Margin = [Windows.Thickness]::new(5,0,5,8)
+    [void]$Body.Children.Add($label)
+
+    $actions = [Windows.Controls.WrapPanel]::new()
+    [void]$Body.Children.Add($actions)
+    $retry = New-PageButton '重试'
+    $retry.add_Click({ if (-not $requests.page) { Load-Detail } })
+    [void]$actions.Children.Add($retry)
+
+    if ($Url -cmatch '^(?:BV[A-Za-z0-9]{10}|av[1-9]\d*)(?:\?[^\s#]*)?$') {
+        $Url = 'https://www.bilibili.com/video/' + $Url
+    }
+    if ($Url -cmatch '^https?://(?:(?:www\.|m\.)?bilibili\.com/video/(?:BV[A-Za-z0-9]{10}|av[1-9]\d*)/?(?:\?[^\s#]*)?(?:#[^\s]*)?|www\.bilibili\.com/bangumi/play/(?:ss|ep)[1-9]\d{0,12})$') {
+        $official = New-PageButton '在浏览器打开'
+        $official.Tag = $Url -creplace '^http:', 'https:'
+        $official.add_Click({
+            param($sender, $event)
+            try { Start-Process -FilePath $sender.Tag }
+            catch { Show-Status '无法打开默认浏览器。' }
+        })
+        [void]$actions.Children.Add($official)
+    }
+    [void]$retry.Focus()
+    Show-Status
+}
+
+function Render-Detail($data, [string]$Failure = '') {
     $script:searchBox = $null
     $script:keyboard = $null
     Set-Header
@@ -963,6 +1011,7 @@ function Render-Detail($data) {
     $return.add_Click({ Back })
     [void]$Body.Children.Add($return)
     [void]$return.Focus()
+    if ($Failure) { $data = $script:page.item }
     if (-not $data) { return }
         $summary = [Windows.Controls.DockPanel]::new()
         $summary.Margin = [Windows.Thickness]::new(5,8,7,22)
@@ -983,6 +1032,10 @@ function Render-Detail($data) {
         [void]$text.Children.Add($desc)
         [void]$summary.Children.Add($text)
         [void]$Body.Children.Add($summary)
+        if ($Failure) {
+            Show-DetailError $Failure $data.url
+            return
+        }
         $heading = New-Text '选集' 21 $normal $true
         $heading.Margin = [Windows.Thickness]::new(7,0,0,8)
         [void]$Body.Children.Add($heading)
@@ -1147,10 +1200,23 @@ function Show-FavoriteFolders([string]$Aid) {
 }
 
 function Load-Detail {
-    Render-Detail $null
+    if ($script:page.detail) { Show-Status '正在刷新详情…' }
+    elseif ($script:page.detailFailure) { Show-Status '正在重试…' }
+    else { Render-Detail $null }
     Invoke-Request 'detail' $script:page.item.url 1 {
         param($data)
-        if (-not $data -or $data.error) { Show-Status ('无法读取详情。' + $data.error); return }
+        if (-not $data -or $data.error) {
+            $message = if ($data.error -match '(?:HTTP 412\.|\[-412\]\.)$') {
+                'B 站暂未接受详情请求（412）。请稍后重试，或在浏览器打开该视频。'
+            } else { '暂时无法读取详情。请重试，或在浏览器打开该视频。' }
+            if ($script:page.detail) { Show-Status '刷新详情失败，仍可使用已加载的详情。' }
+            else {
+                $script:page.detailFailure = $message
+                Render-Detail $null $message
+            }
+            return
+        }
+        $script:page.detailFailure = $null
         $script:page.detail = $data
         Render-Detail $data
         if ($script:page.view -and $script:page.view -ne 'detail') {
@@ -1245,6 +1311,13 @@ $Viewport.add_ScrollChanged({
     if ($event.VerticalChange -gt 0 -and $script:page.more -and -not $requests.page -and
         $sender.ScrollableHeight - $sender.VerticalOffset -lt 120) { Load-Page $true }
 })
+# Dynamic cards use the window tag to show focus only during keyboard navigation.
+$window.Tag = $false
+$window.add_PreviewMouseDown({ param($sender, $event) $sender.Tag = $false })
+$window.add_PreviewMouseWheel({ param($sender, $event) $sender.Tag = $false })
+$window.add_PreviewMouseMove({ param($sender, $event)
+    if ($sender.Tag -and $event.GetPosition($sender) -ne $script:keyboardPointer) { $sender.Tag = $false }
+})
 $window.add_PreviewMouseUp({ param($sender, $event)
     if ($event.ChangedButton -eq 'Right') {
         $event.Handled = $true
@@ -1252,6 +1325,10 @@ $window.add_PreviewMouseUp({ param($sender, $event)
     }
 })
 $window.add_PreviewKeyDown({ param($sender, $event)
+    if ($event.Key -in @('Up','Down','Left','Right','Tab','Home','End','PageUp','PageDown','Return','Space')) {
+        $script:keyboardPointer = [Windows.Input.Mouse]::GetPosition($sender)
+        $sender.Tag = $true
+    }
     if ($event.Key -in @('Escape','BrowserBack')) { $event.Handled = $true; Invoke-BrowserBack; return }
     if ($SignInOverlay.Visibility -eq 'Visible') {
         Invoke-BrowserSignInKey $event
@@ -1323,8 +1400,13 @@ $window.add_PreviewKeyDown({ param($sender, $event)
 $clock = [Windows.Threading.DispatcherTimer]::new()
 $clock.Interval = [TimeSpan]::FromSeconds(15)
 $clockCulture = [Globalization.CultureInfo]::GetCultureInfo('zh-CN')
-$clock.add_Tick({ $ClockText.Text = [DateTime]::Now.ToString('tth:mm', $clockCulture); Sync-AccountProfile })
-$ClockText.Text = [DateTime]::Now.ToString('tth:mm', $clockCulture)
+function Update-Clock {
+    $now = [DateTime]::Now
+    $ClockPeriod.Text = $now.ToString('tt', $clockCulture)
+    $ClockValue.Text = $now.ToString('h:mm', $clockCulture)
+}
+$clock.add_Tick({ Update-Clock; Sync-AccountProfile })
+Update-Clock
 $clock.Start()
 $focusTimer = [Windows.Threading.DispatcherTimer]::new()
 if ($PlayMailbox) {

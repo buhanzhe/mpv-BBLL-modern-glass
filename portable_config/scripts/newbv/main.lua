@@ -17,6 +17,10 @@ local live_streams
 local live_choice
 local part_titles = {}
 local quality_state
+local playlist_entry
+local vod
+local vod_retry
+local ended_vod
 local preference_path = os.getenv('LOCALAPPDATA')
 local settings_path = preference_path and utils.join_path(preference_path, 'mpv-newbv/settings.json')
 preference_path = preference_path and utils.join_path(preference_path, 'mpv-newbv-quality.json')
@@ -39,6 +43,7 @@ local function load_preferences()
     if type(saved) ~= 'table' then saved = {} end
     return {
         quality = valid_quality(saved.quality, 127) and saved.quality or nil,
+        qualityRevision = type(saved.qualityRevision)=='string' and saved.qualityRevision or nil,
         codec = (saved.codec == 'h264' or saved.codec == 'hevc' or saved.codec == 'av1') and saved.codec or '',
         live = valid_quality(saved.live, 30000) and saved.live or nil,
     }
@@ -70,11 +75,144 @@ local function tell(text)
     mp.msg.info(text)
 end
 
+local function selected_track(kind, option)
+    if mp.get_property('options/' .. option) == 'no' then return false end
+    local track = mp.get_property_native('current-tracks/' .. kind)
+    if track and not track.external then return track.title end
+end
+
+local function vod_selection(state)
+    local video, audio = selected_track('video', 'vid'), selected_track('audio', 'aid')
+    if video == nil and audio == nil then return state.selection end
+    return {video = video, audio = audio}
+end
+
+local function vod_sources(data)
+    local sources = {data.video}
+    for _, url in ipairs(data.backupVideos or {data.backupVideo}) do
+        if #sources == 4 then break end
+        if type(url) == 'string' and url ~= sources[#sources] then sources[#sources + 1] = url end
+    end
+    if #sources == 1 then sources[2] = data.video end
+    return sources
+end
+
+local function retry_vod(state, position, selection, reason)
+    if vod_retry or state.exhausted then return end
+    local current = mp.get_property_number('playlist-current-pos', -1)
+    if current < 0 or mp.get_property_number(('playlist/%d/id'):format(current)) ~= state.entry then return end
+    local index = state.index + 1
+    if not state.sources[index] then
+        state.exhausted = true
+        tell('播放线路均已尝试，可重新打开视频再试。')
+        return
+    end
+    vod_retry = {entry = state.entry, url = state.url, data = state.data, position = position,
+        sources = state.sources, index = index, selection = selection}
+    if state.sources[index] == state.sources[state.index] then
+        tell(reason .. '，正在重新连接并续播。')
+    else
+        tell(('%s，正在切换到线路 %d/%d 并续播。'):format(reason, index, #state.sources))
+    end
+    if not mp.commandv('playlist-play-index', 'current', 'yes') then
+        vod_retry = nil
+        state.exhausted = true
+    end
+end
+
+mp.enable_messages('warn')
+mp.register_event('log-message', function(event)
+    if not vod then return end
+    if (event.prefix == 'curl' and event.level == 'error')
+        or (event.prefix == 'timeline' and event.text:find('failed to load segment', 1, true))
+        or (event.prefix == 'ffmpeg/demuxer' and event.text:find('partial file', 1, true)) then
+        vod.network_error = mp.get_time()
+    end
+end)
+
+mp.add_periodic_timer(0.5, function()
+    local state = vod
+    if not state or not state.last_progress or state.exhausted or vod_retry then return end
+    local now = mp.get_time()
+    local position = mp.get_property_number('time-pos')
+    if mp.get_property_bool('pause') or mp.get_property_bool('eof-reached') then
+        state.position, state.last_progress = position, now
+        state.missing_video_since, state.missing_video_position = nil, nil
+        return
+    end
+    if position ~= state.position then state.position, state.last_progress = position, now end
+    -- A failed delayed-open video track can leave the audio clock running.
+    if mp.get_property_number('vid') and not mp.get_property('video-dec-params/pixelformat') then
+        state.missing_video_since = state.missing_video_since or now
+        state.missing_video_position = state.missing_video_position or position
+    else
+        state.missing_video_since, state.missing_video_position = nil, nil
+    end
+    local seeking = mp.get_property_bool('seeking')
+    local network_failed = state.network_error and now - state.network_error < 20
+    local stall_timeout = seeking and (network_failed and 5 or 15) or (network_failed and 3 or 8)
+    if now - math.min(state.last_progress, state.missing_video_since or now) < stall_timeout then return end
+    if mp.get_property_number('playlist-current-pos') ~= mp.get_property_number('playlist-playing-pos')
+        or mp.get_property('path') ~= state.url then return end
+    retry_vod(state, state.missing_video_position or position or state.resume, vod_selection(state), '播放停滞')
+end)
+
+mp.register_event('seek', function()
+    if vod and vod.last_progress then
+        vod.last_progress = mp.get_time()
+        vod.missing_video_since, vod.missing_video_position = nil, nil
+    end
+end)
+
+local audio_check
+mp.add_periodic_timer(0.25, function()
+    local check = audio_check
+    if not check then return end
+    local aid = mp.get_property_number('aid')
+    local position = mp.get_property_number('time-pos')
+    local audio = mp.get_property_number('audio-pts')
+    if not aid or not position or mp.get_property_bool('pause', false)
+        or mp.get_property_bool('seeking', false) or mp.get_property_bool('paused-for-cache', false) then
+        check.start, check.position, check.pts = nil, nil, nil
+        return
+    end
+    if check.aid ~= aid then
+        if check.next ~= aid then check.failed = {} end
+        check.aid, check.start, check.next, check.pts = aid, position, nil, audio
+    elseif audio and (not check.pts or audio > check.pts + 0.005) then
+        check.start = position
+    elseif not check.start or (check.position and position < check.position) then
+        check.start = position
+    elseif position - check.start >= 1.0 and not check.failed[aid] then
+        check.failed[aid] = true
+        local current, choices = nil, {}
+        for _, track in ipairs(mp.get_property_native('track-list', {})) do
+            if track.type == 'audio' then
+                if track.id == aid then current = track
+                elseif not check.failed[track.id] then choices[#choices + 1] = track end
+            end
+        end
+        local target = choices[1]
+        if current then
+            for _, track in ipairs(choices) do
+                if track.codec == current.codec then target = track; break end
+            end
+        end
+        if target then
+            check.next = target.id
+            mp.set_property_number('aid', target.id)
+            tell('当前音轨未输出，已切换到 ' .. (target.title or ('音轨 ' .. target.id)) .. '。')
+        end
+    end
+    check.position, check.pts = position, audio
+end)
+
 local function request(action, value, callback, live_quality, settings)
     settings = settings or {}
-    local quality = preferences.quality or (valid_quality(settings.quality, 127) and settings.quality)
+    local use_memory = settings.qualityRevision == nil or settings.qualityRevision == preferences.qualityRevision
+    local quality = use_memory and preferences.quality or (valid_quality(settings.quality, 127) and settings.quality)
         or (valid_quality(options.quality, 127) and options.quality or 127)
-    local preferred_codec = preferences.codec ~= '' and preferences.codec or settings.codec
+    local preferred_codec = use_memory and preferences.codec ~= '' and preferences.codec or settings.codec
     if preferred_codec ~= 'h264' and preferred_codec ~= 'hevc' and preferred_codec ~= 'av1' then preferred_codec = '' end
     local preferred_audio = settings.audio
     if preferred_audio ~= 'flac' and preferred_audio ~= 'eac3' then preferred_audio = 'aac' end
@@ -143,11 +281,18 @@ local function current_quality_track(state, track)
     if not track or track.type ~= 'video' or track.external then return end
     local info = state.tracks[track.id]
     if info and track.title == info.title then return info end
+    -- An unavailable eager track can shift the IDs of the remaining EDL tracks.
+    for _, entry in pairs(state.tracks) do
+        if track.title == entry.title then return entry end
+    end
 end
 
 local function remember_track(info)
-    if not info or (info.quality == preferences.quality and info.codec == preferences.codec) then return end
+    if not info then return end
+    local revision=read_settings().qualityRevision
+    if info.quality == preferences.quality and info.codec == preferences.codec and revision == preferences.qualityRevision then return end
     preferences.quality, preferences.codec = info.quality, info.codec
+    preferences.qualityRevision=revision
     save_preferences()
 end
 
@@ -264,7 +409,8 @@ local function browse(current, view, signin)
         end
     end
     local args = {shell, '-NoLogo', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'RemoteSigned',
-                  '-File', browser, '-PlayMailbox', mailbox, '-MpvProcessId', tostring(utils.getpid())}
+                  '-File', browser, '-PlayMailbox', mailbox, '-MpvProcessId', tostring(utils.getpid()),
+                  '-DefaultAutobrowse', options.autobrowse and 'yes' or 'no'}
     if signin then args[#args + 1] = '-SignInOnStart' end
     if current then
         args[#args + 1] = '-CurrentVideo'
@@ -295,14 +441,25 @@ local function browse(current, view, signin)
 end
 
 local startup_browser
-if options.autobrowse then
-    startup_browser = mp.add_timeout(0.2, function()
-        if not browser_request and mp.get_property_bool('idle-active', false)
-            and mp.get_property_number('playlist-count', 0) == 0
-            and mp.get_property('options/force-window', 'no') ~= 'no'
-            and mp.get_property('options/vo') ~= 'null' then
+local tv_autoplay = 'user-data/ntv-tv/autoplay-started'
+local autobrowse = read_settings().autobrowse
+if type(autobrowse) ~= 'boolean' then autobrowse = options.autobrowse end
+local start_browser = autobrowse and mp.get_property('options/force-window','no') ~= 'no'
+    and mp.get_property('options/vo') ~= 'null'
+mp.set_property_native('user-data/newbv/autostart', start_browser)
+if start_browser then
+    local function try_autobrowse()
+        if not startup_browser then return end
+        startup_browser:kill()
+        startup_browser = nil
+        local empty = mp.get_property_bool('idle-active', false) and mp.get_property_number('playlist-count', 0) == 0
+        if not browser_request and (empty or mp.get_property_bool(tv_autoplay, false)) then
             browse()
         end
+    end
+    startup_browser = mp.add_timeout(0.2, try_autobrowse)
+    mp.observe_property(tv_autoplay, 'bool', function(_, starting)
+        if starting then try_autobrowse() end
     end)
 end
 
@@ -327,24 +484,28 @@ mp.register_script_message('submit', submit)
 
 mp.add_hook('on_load', 5, function(hook)
     local url = mp.get_property('stream-open-filename', '')
+    local retry = vod_retry
+    vod_retry = nil
+    if retry and (retry.entry ~= playlist_entry or retry.url ~= url) then retry = nil end
     if not playback_url(url) then return end
-    tell('正在获取播放地址…')
+    if not retry then tell('正在获取播放地址…') end
     hook:defer()
     local preferred_live = live_choice and live_choice.url == url and live_choice or nil
     live_choice = nil
     preferences = load_preferences()
     local live_quality = preferred_live and preferred_live.quality or preferences.live or 30000
     local settings = read_settings()
-    if not live_url(url) and type(settings.speed) == 'number' and settings.speed >= 0.25 and settings.speed <= 2 then
+    if not retry and not live_url(url) and type(settings.speed) == 'number' and settings.speed >= 0.25 and settings.speed <= 2 then
         mp.set_property_number('file-local-options/speed', settings.speed)
     end
     if settings.subtitles == 'no' then mp.set_property('file-local-options/sid', 'no') end
-    request('resolve', url, function(data, err)
+    local function resolved(data, err)
         if data and data.video then
             history.set(data.history)
             mp.set_property_native('user-data/newbv/byline', data.byline or '')
             mp.set_property('file-local-options/user-agent', data.userAgent or '')
             mp.set_property('file-local-options/referrer', data.referrer or '')
+            mp.set_property('file-local-options/audio-file-auto', 'no')
             if data.title then mp.set_property('file-local-options/force-media-title', data.title) end
             local selected = data.video
             if live_url(url) and data.lines and #data.lines > 0 then
@@ -356,26 +517,59 @@ mp.add_hook('on_load', 5, function(hook)
                 mp.set_property('file-local-options/ytdl', 'no')
             end
             if data.defaultVid and data.tracks then
+                local connect_timeout = mp.get_property_number('options/curl-connect-timeout')
+                if connect_timeout and (connect_timeout == 0 or connect_timeout > 8) then
+                    mp.set_property_number('file-local-options/curl-connect-timeout', 8)
+                end
                 local tracks = {}
                 for _, track in ipairs(data.tracks) do tracks[track.id] = track end
                 mp.set_property('file-local-options/vid', 'auto')
-                if settings.audio == 'flac' or settings.audio == 'eac3' then
-                    mp.set_property('file-local-options/aid', 'auto')
+                if type(data.defaultAid) == 'number' then
+                    if mp.get_property('options/aid') ~= 'no' then
+                        mp.set_property_number('file-local-options/aid', data.defaultAid)
+                    end
+                    audio_check = {failed = {}}
                 end
                 quality_state = {tracks = tracks}
+                vod = {url = url, entry = playlist_entry, data = data,
+                    sources = retry and retry.sources or vod_sources(data), index = retry and retry.index or 1,
+                    selection = retry and retry.selection, resume = retry and retry.position}
+                selected = vod.sources[vod.index]
+                if retry then
+                    if retry.position then mp.set_property('file-local-options/start', tostring(retry.position)) end
+                end
             end
             mp.set_property('stream-open-filename', selected)
-            mp.osd_message('', 0)
+            if not retry then mp.osd_message('', 0) end
         else
             tell(err or '接口没有返回播放地址。')
         end
         hook:cont()
-    end, live_quality, settings)
+    end
+    if retry then resolved(retry.data) else request('resolve', url, resolved, live_quality, settings) end
+end)
+
+mp.add_hook('on_preloaded', 5, function()
+    local selection = vod and vod.selection
+    if not selection then return end
+    if selection.video == false then mp.set_property('file-local-options/vid', 'no') end
+    if selection.audio == false then mp.set_property('file-local-options/aid', 'no') end
+    for _, track in ipairs(mp.get_property_native('track-list', {})) do
+        if track.title and not track.external then
+            if track.type == 'video' and track.title == selection.video then
+                mp.set_property_number('file-local-options/vid', track.id)
+            elseif track.type == 'audio' and track.title == selection.audio then
+                mp.set_property_number('file-local-options/aid', track.id)
+            end
+        end
+    end
 end)
 
 mp.register_event('file-loaded', function()
-    if mp.get_property_native('user-data/newbv/danmaku-adapter') then return end
+    if vod then vod.last_progress = mp.get_time() end
     local path = mp.get_property('path', '')
+    mp.set_property_bool('user-data/newbv/playing', playback_url(path) ~= nil)
+    if mp.get_property_native('user-data/newbv/danmaku-adapter') then return end
     if not video_url(path) then return end
     local setting = read_settings().danmaku
     if setting == 'on' or setting == 'off' then
@@ -383,13 +577,17 @@ mp.register_event('file-loaded', function()
     end
 end)
 
-mp.register_event('start-file', function()
-    if startup_browser then
+mp.register_event('start-file', function(event)
+    playlist_entry = event.playlist_entry_id
+    mp.set_property_bool('user-data/newbv/playing', false)
+    if startup_browser and not mp.get_property_bool(tv_autoplay, false) then
         startup_browser:kill()
         startup_browser = nil
     end
     live_streams = nil
     quality_state = nil
+    audio_check = nil
+    vod = nil
     mp.set_property_native('user-data/newbv/byline', '')
 end)
 
@@ -403,7 +601,36 @@ local function switch_live(index, quality)
     mp.commandv('loadfile', live_streams.url, 'replace')
 end
 
-mp.register_event('end-file', function() quality_state = nil end)
+mp.add_hook('on_unload', 5, function()
+    if not vod then return end
+    local limited = mp.get_property('options/end', 'none') ~= 'none'
+        or mp.get_property('options/length', 'none') ~= 'none'
+    vod.ending = {position = vod.missing_video_position or mp.get_property_number('time-pos') or vod.resume,
+        duration = not limited and mp.get_property_number('duration') or nil, selection = vod_selection(vod)}
+end)
+
+mp.register_event('end-file', function(event)
+    mp.set_property_bool('user-data/newbv/playing', false)
+    quality_state = nil
+    audio_check = nil
+    local ending = vod and vod.ending
+    local premature = ending and ending.position and ending.duration and ending.duration - ending.position > 3
+    if vod and vod.entry == event.playlist_entry_id
+        and (event.reason == 'error' or (event.reason == 'eof' and premature
+            and vod.network_error and mp.get_time() - vod.network_error < 20)) then
+        ended_vod = vod
+    end
+    vod = nil
+end)
+
+-- Before mpv advances the playlist, retry the entry whose connection ended.
+mp.add_hook('on_after_end_file', 5, function()
+    local state = ended_vod
+    ended_vod = nil
+    if not state then return end
+    local ending = state.ending or {}
+    retry_vod(state, ending.position or state.resume, ending.selection or state.selection, '当前线路已中断')
+end)
 
 mp.add_hook('on_load_fail', 5, function()
     if not live_streams or live_streams.index >= #live_streams.lines then return end
